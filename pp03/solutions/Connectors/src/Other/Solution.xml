@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ImportExportXml version="9.2" SolutionPackageVersion="9.2" languagecode="1033" generatedBy="Platypal">
+  <SolutionManifest>
+    <UniqueName>Connectors</UniqueName>
+    <LocalizedNames>
+      <LocalizedName description="Connectors" languagecode="1033" />
+    </LocalizedNames>
+    <Descriptions />
+    <Version>1.0.0.0</Version>
+    <Managed>0</Managed>
+    <Publisher>
+      <UniqueName>DefaultPublisher</UniqueName>
+    </Publisher>
+    <RootComponents />
+    <MissingDependencies />
+  </SolutionManifest>
+</ImportExportXml>
