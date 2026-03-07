@@ -1,0 +1,198 @@
+name: pp02 Power Platform Workflow
+on:
+  workflow_dispatch:
+    inputs:
+      integrationId:
+        description: "Power Platform solution identifier"
+        required: true
+        default: "pp02"
+        type: string
+      solutionType:
+        description: "Solution type to pack"
+        required: true
+        default: "Managed"
+        type: choice
+        options:
+          - Managed
+          - Unmanaged
+          - Both
+
+jobs:
+  # Build job: discovers and packs all Power Platform solutions
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      solutions_found: ${{ steps.discover.outputs.solutions_found }}
+      solution_names: ${{ steps.discover.outputs.solution_names }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Power Platform CLI
+        run: |
+          dotnet tool install --global Microsoft.PowerApps.CLI.Tool --version 1.*
+          echo "$HOME/.dotnet/tools" >> $GITHUB_PATH
+
+      - name: Discover solutions
+        id: discover
+        run: |
+          SOLUTIONS_ROOT="${{ inputs.integrationId }}/solutions"
+          FOUND=()
+          
+          if [ -d "$SOLUTIONS_ROOT" ]; then
+            for dir in "$SOLUTIONS_ROOT"/*/; do
+              if [ -f "${dir}src/Other/Solution.xml" ]; then
+                NAME=$(basename "$dir")
+                FOUND+=("$NAME")
+                echo "Found solution: $NAME"
+              fi
+            done
+          fi
+          
+          if [ ${#FOUND[@]} -eq 0 ]; then
+            echo "No solution sources found"
+            echo "solutions_found=false" >> $GITHUB_OUTPUT
+            echo "solution_names=" >> $GITHUB_OUTPUT
+          else
+            echo "Found ${#FOUND[@]} solution(s)"
+            echo "solutions_found=true" >> $GITHUB_OUTPUT
+            # JSON array for matrix strategy
+            JSON=$(printf '%s\n' "${FOUND[@]}" | jq -R . | jq -sc .)
+            echo "solution_names=$JSON" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Pack solutions
+        if: steps.discover.outputs.solutions_found == 'true'
+        run: |
+          SOLUTIONS_ROOT="${{ inputs.integrationId }}/solutions"
+          OUTPUT_DIR="artifacts/PowerPlatformSolutions"
+          mkdir -p "$OUTPUT_DIR"
+          
+          for dir in "$SOLUTIONS_ROOT"/*/; do
+            if [ -f "${dir}src/Other/Solution.xml" ]; then
+              NAME=$(basename "$dir")
+              echo "Packing solution: $NAME"
+              
+              pac solution pack \
+                --folder "${dir}src" \
+                --zipfile "$OUTPUT_DIR/$NAME.zip" \
+                --packagetype "${{ inputs.solutionType }}" \
+                --processCanvasApps
+              
+              echo "Solution '$NAME' packed successfully!"
+            fi
+          done
+
+      - name: Upload solution artefacts
+        if: steps.discover.outputs.solutions_found == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: power-platform-solutions
+          path: artifacts/PowerPlatformSolutions/
+
+  # Deploy Bicep support resources
+  deploy-bicep:
+    needs: build
+    uses: ./.github/workflows/deploy-integration-env.yml
+    secrets: inherit
+    with:
+      integration_id: ${{ inputs.integrationId }}
+      bicep_file: ${{ inputs.integrationId }}/Deployment/Bicep/Main.bicep
+
+  # Import solutions to Power Platform environments
+  deploy-solution:
+    needs: [build, deploy-bicep]
+    if: needs.build.outputs.solutions_found == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      max-parallel: 1
+      matrix:
+        environment: [dev, test, prod]
+    environment: ${{ matrix.environment }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download solution artefacts
+        uses: actions/download-artifact@v4
+        with:
+          name: power-platform-solutions
+          path: solutions
+
+      - name: Install Power Platform CLI
+        run: |
+          dotnet tool install --global Microsoft.PowerApps.CLI.Tool --version 1.*
+          echo "$HOME/.dotnet/tools" >> $GITHUB_PATH
+
+      - name: Import solutions to ${{ matrix.environment }}
+        env:
+          PP_TENANT_ID: ${{ secrets.PP_TENANT_ID }}
+          PP_CLIENT_ID: ${{ secrets.PP_CLIENT_ID }}
+          PP_CLIENT_SECRET: ${{ secrets.PP_CLIENT_SECRET }}
+          PP_ENVIRONMENT_URL: ${{ vars.PP_ENVIRONMENT_URL }}
+        run: |
+          echo "Authenticating to Power Platform (${{ matrix.environment }})..."
+          pac auth create \
+            --environment "$PP_ENVIRONMENT_URL" \
+            --applicationId "$PP_CLIENT_ID" \
+            --clientSecret "$PP_CLIENT_SECRET" \
+            --tenant "$PP_TENANT_ID"
+          
+          SETTINGS_ROOT="${{ inputs.integrationId }}/Deployment/PowerPlatform/solution-settings"
+          
+          # Import each solution zip in alphabetical order
+          for zipfile in $(ls solutions/*.zip 2>/dev/null | sort); do
+            SOLUTION_NAME=$(basename "$zipfile" .zip)
+            echo "============================================"
+            echo "Importing solution: $SOLUTION_NAME"
+            echo "============================================"
+            
+            IMPORT_ARGS=(
+              solution import
+              --path "$zipfile"
+              --activate-plugins true
+              --force-overwrite true
+              --publish-changes true
+              --async
+              --max-async-wait-in-min 120
+            )
+            
+            # Look for per-solution settings: solution-settings/{SolutionName}/{env}.json
+            PER_SOLUTION_SETTINGS="$SETTINGS_ROOT/$SOLUTION_NAME/${{ matrix.environment }}.json"
+            SHARED_SETTINGS="$SETTINGS_ROOT/${{ matrix.environment }}.json"
+            
+            if [ -f "$PER_SOLUTION_SETTINGS" ]; then
+              echo "  Applying per-solution settings: $PER_SOLUTION_SETTINGS"
+              IMPORT_ARGS+=(--settings-file "$PER_SOLUTION_SETTINGS")
+            elif [ -f "$SHARED_SETTINGS" ]; then
+              echo "  Applying shared settings: $SHARED_SETTINGS"
+              IMPORT_ARGS+=(--settings-file "$SHARED_SETTINGS")
+            else
+              echo "  No settings file found - importing without settings override"
+            fi
+            
+            pac "${IMPORT_ARGS[@]}"
+            echo "Solution '$SOLUTION_NAME' imported successfully!"
+          done
+
+  summary:
+    needs: [build, deploy-bicep, deploy-solution]
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: Deployment Summary
+        run: |
+          echo "## 🚀 Power Platform Deployment Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Solution ID:** ${{ inputs.integrationId }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Solution Type:** ${{ inputs.solutionType }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Build Status:** ${{ needs.build.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Bicep Deploy Status:** ${{ needs.deploy-bicep.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Solution Import Status:** ${{ needs.deploy-solution.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ "${{ needs.build.result }}" = "success" ] && [ "${{ needs.deploy-solution.result }}" = "success" ]; then
+            echo "✅ **Power Platform deployment completed successfully!**" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ **Deployment failed. Check the logs above.**" >> $GITHUB_STEP_SUMMARY
+          fi
